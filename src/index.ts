@@ -340,12 +340,17 @@ export async function getCodeFixesFromProject(project: Project, opt: Options, ho
 
 export function getDiagnostics(project: Project): (readonly Diagnostic[])[] {
   const compilerOptions = project.program.getCompilerOptions();
-  const diagnostics = project.program.getSourceFiles().map(function (file: SourceFile) {
+  const sourceFiles = project.program.getSourceFiles();
+  const allDiagnostics = sourceFiles.map(function (file: SourceFile) {
     return [
       ...(compilerOptions.declaration || compilerOptions.composite ? project.program.getDeclarationDiagnostics(file) : []),
       ...project.program.getSemanticDiagnostics(file),
     ];
   });
+  
+  // Filter out files with no diagnostics
+  const diagnostics = allDiagnostics.filter((fileDiagnostics) => fileDiagnostics.length > 0);
+  
   return diagnostics;
 }
 
@@ -423,7 +428,7 @@ export function filterDiagnosticsByFileAndErrorCode(diagnostics: (readonly Diagn
   // otherwise, use all errors
   return [filteredDiagnostics, [`Found ${_.reduce(filteredDiagnostics.map((d: { length: any; }) => d.length), function (sum, n) {
     return sum + n;
-  }, 0)} diagnostics in ${diagnostics.length} files`]];
+  }, 0)} diagnostics in ${filteredDiagnostics.length} files with errors`]];
 }
 
 export interface FixAndDiagnostic {
@@ -434,21 +439,138 @@ export interface FixAndDiagnostic {
 export function getCodeFixesForFile(project: Project, diagnostics: readonly Diagnostic[]): FixAndDiagnostic[] {
   // expects already filtered diagnostics
   const service = project.languageService;
+  const checker = project.program.getTypeChecker();
+  
   return flatMap(diagnostics, d => {
     if (d.file && typeof d.start === "number" && d.length) {
-      return service.getCodeFixesAtPosition(
+      // Get standard fixes
+      let fixes = service.getCodeFixesAtPosition(
         d.file.fileName,
         d.start,
         d.start + d.length,
         [d.code],
         project.ts.getDefaultFormatCodeSettings(os.EOL),
-        {}).map((fix: CodeFixAction) => {
-          return { fix, diagnostic: d };
+        {
+          includeInlayParameterNameHints: "all",
+          includeInlayParameterNameHintsWhenArgumentMatchesName: false,
+          includeInlayFunctionParameterTypeHints: true,
+          includeInlayVariableTypeHints: true,
+          includeInlayPropertyDeclarationTypeHints: true,
+          includeInlayFunctionLikeReturnTypeHints: true,
+          includeInlayEnumMemberValueHints: true,
         });
+
+      // Try to provide more specific types for certain patterns
+      if (fixes.some(fix => fix.changes.some(change => 
+          change.textChanges.some(tc => tc.newText === ': any')))) {
+        const sourceFile = project.program.getSourceFile(d.file.fileName);
+        if (sourceFile) {
+          const node = findNodeAtPosition(sourceFile, d.start, project.ts);
+          let varDecl = node;
+          while (varDecl && !project.ts.isVariableDeclaration(varDecl)) {
+            varDecl = varDecl.parent;
+          }
+          
+          if (varDecl && project.ts.isVariableDeclaration(varDecl) && varDecl.initializer) {
+            const enhancedType = inferEnhancedType(varDecl.initializer, project);
+            
+            if (enhancedType && enhancedType !== 'any') {
+              // Create enhanced fixes
+              const annotationFix: CodeFixAction = {
+                fixName: 'add-annotation',
+                description: `Add annotation of type '${enhancedType}'`,
+                changes: [{
+                  fileName: d.file.fileName,
+                  textChanges: [{
+                    span: {
+                      start: varDecl.name.end,
+                      length: 0
+                    },
+                    newText: `: ${enhancedType}`
+                  }]
+                }]
+              };
+              
+              const satisfiesFix: CodeFixAction = {
+                fixName: 'add-type-assertion',
+                description: `Add satisfies and an inline type assertion with '${enhancedType}'`,
+                changes: [{
+                  fileName: d.file.fileName,
+                  textChanges: [{
+                    span: {
+                      start: varDecl.initializer.pos,
+                      length: varDecl.initializer.end - varDecl.initializer.pos
+                    },
+                    newText: `${varDecl.initializer.getText(sourceFile)} satisfies ${enhancedType} as ${enhancedType}`
+                  }]
+                }]
+              };
+              
+              // Replace the original fixes with our enhanced ones
+              fixes = [annotationFix, satisfiesFix];
+              return fixes.map((fix: CodeFixAction) => {
+                return { fix, diagnostic: d };
+              });
+            }
+          }
+        }
+      }
+
+      return fixes.map((fix: CodeFixAction) => {
+        return { fix, diagnostic: d };
+      });
     } else {
       return [];
     }
-  })
+  });
+}
+
+function findNodeAtPosition(sourceFile: any, position: number, ts: any): any {
+  function find(node: any): any {
+    if (position >= node.getStart() && position < node.getEnd()) {
+      return ts.forEachChild(node, find) || node;
+    }
+  }
+  return find(sourceFile);
+}
+
+function inferEnhancedType(initializer: any, project: Project): string | undefined {
+  // Handle function calls that return functions with object literal arguments
+  if (project.ts.isCallExpression(initializer) && initializer.arguments.length > 0) {
+    const firstArg = initializer.arguments[0];
+    
+    // If the first argument is an object literal, try to infer a Record type
+    if (project.ts.isObjectLiteralExpression(firstArg)) {
+      const properties = firstArg.properties.filter(p => project.ts.isPropertyAssignment(p));
+      
+      if (properties.length > 0) {
+        // Extract property keys
+        const keys = properties
+          .map(p => p.name?.getText())
+          .filter(name => name)
+          .map(name => `"${name}"`)
+          .join(' | ');
+        
+        // Check if the call returns a function (common pattern for style generators)
+        const functionName = initializer.expression.getText();
+        
+        // For common patterns like style generators, return a function type
+        // This is a heuristic based on common library patterns
+        if (keys && (functionName.includes('Style') || 
+                    functionName.includes('styles') || 
+                    functionName.includes('Classes'))) {
+          return `() => Record<${keys}, string>`;
+        }
+        
+        // For other patterns, return a simple Record type
+        if (keys) {
+          return `Record<${keys}, any>`;
+        }
+      }
+    }
+  }
+  
+  return undefined;
 }
 
 function getFileTextChangesFromCodeFix(codefix: CodeFixAction): readonly FileTextChanges[] {
